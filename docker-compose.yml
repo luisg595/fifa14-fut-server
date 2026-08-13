@@ -1,0 +1,27 @@
+services:
+  app:
+    build: .
+    container_name: fifa14-fut
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "0.0.0.0:42129:42129"   # redirector TLS
+      - "0.0.0.0:42128:42128"   # main Blaze
+      - "0.0.0.0:8080:8080"     # http bootstrap
+      - "0.0.0.0:8099:8099"     # FUT HTTP (health/admin/ca/upload también aquí)
+      - "0.0.0.0:8306:8306"     # dynamic messages
+      - "0.0.0.0:44125:44125"   # GOSCA
+    volumes:
+      - fifa14-state:/app/state
+      - fifa14-artifacts:/app/artifacts
+      - fifa14-certs:/app/certs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8099/__fifa14_local_fut_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  fifa14-state:
+  fifa14-artifacts:
+  fifa14-certs:
