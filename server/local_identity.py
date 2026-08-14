@@ -646,6 +646,20 @@ class LocalIdentityStore:
         self._provision_persona(persona_id)
         return persona_id
 
+    def lookup_account(self, account_key: str) -> int | None:
+        """Resolve an existing account key to its persona, without creating one.
+
+        Unlike resolve_persona this never provisions a new persona, so an admin
+        targeting a typo'd account key gets an explicit not-found error instead
+        of a phantom account.
+        """
+        key = (account_key or "").strip()
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT persona_id FROM local_accounts WHERE account_key = ?", (key,)
+            ).fetchone()
+        return int(row["persona_id"]) if row is not None else None
+
     def persona_id_for_sid(self, sid: str | None) -> int | None:
         if not sid:
             return None

@@ -2528,7 +2528,11 @@ class HttpProbe(BaseHTTPRequestHandler):
                 emit("v237-admin-give-coins", path=self.path, status=401)
                 return
             try:
-                coins = int(json.loads(body.decode("utf-8")).get("coins", 0))
+                request_body = json.loads(body.decode("utf-8"))
+                coins = int(request_body.get("coins", 0))
+                account_key = request_body.get("account")
+                if account_key is not None:
+                    account_key = str(account_key).strip()
             except (ValueError, TypeError, KeyError):
                 payload = build_fut_json_payload({"error": "invalid-body"})
                 self.send_response(400)
@@ -2543,6 +2547,24 @@ class HttpProbe(BaseHTTPRequestHandler):
                 self.send_header("connection", "close")
                 emit("v237-admin-give-coins", path=self.path, status=500, reason="no-identity-store")
                 return
+            if account_key:
+                persona_id = None
+                if hasattr(identity_store, "lookup_account"):
+                    try:
+                        persona_id = identity_store.lookup_account(account_key)
+                    except Exception:
+                        persona_id = None
+                if persona_id is None:
+                    payload = build_fut_json_payload({
+                        "error": "account-not-found",
+                        "detail": "No local account has this account key.",
+                    })
+                    self.send_response(404)
+                    self.send_header("content-type", "application/json; charset=utf-8")
+                    self.send_header("connection", "close")
+                    emit("v237-admin-give-coins", path=self.path, status=404, account=account_key)
+                    return
+                set_client_persona(persona_id)
             try:
                 result = identity_store.set_club_coin_balance(coins)
             except ValueError as error:
@@ -2559,7 +2581,7 @@ class HttpProbe(BaseHTTPRequestHandler):
             self.send_header("connection", "close")
             emit(
                 "v237-admin-give-coins", path=self.path, status=200,
-                coins=coins, balance=int(result["balanceAfter"]),
+                account=account_key or None, coins=coins, balance=int(result["balanceAfter"]),
             )
         elif (
             probe_name in {"fut-http", "dynamic-http"}
