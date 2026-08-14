@@ -18,6 +18,7 @@ from local_identity import (
     PLAYER_CATALOG,
     PLAYER_BY_ASSET,
     PLAYER_ITEM_TYPE,
+    set_client_persona,
 )
 
 BETA_SCHEMA = "fifa14-local-fut-v2.41.1-beta2.24"
@@ -429,33 +430,7 @@ class BetaIdentityStore(LocalIdentityStore):
             identity = self._identity(connection)
             persona_id = int(identity["persona_id"])
             now = int(time.time())
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO beta_accounts (
-                    persona_id, account_uuid, discord_user_id, discord_username,
-                    auth_state, created_at, last_seen, dnf_modifier
-                ) VALUES (?, ?, NULL, NULL, 'local-unlinked', ?, ?, 1.25)
-                """,
-                (persona_id, str(uuid.uuid4()), now, now),
-            )
-            connection.execute(
-                "UPDATE beta_accounts SET last_seen=? WHERE persona_id=?",
-                (now, persona_id),
-            )
-            for season in OFFLINE_SEASONS:
-                connection.execute(
-                    """INSERT OR IGNORE INTO beta_offline_seasons
-                    (persona_id,season_id,division,matches_played,points,won,draw,lost,trophies_won,active,updated_at)
-                    VALUES (?,?,?,0,0,0,0,0,0,1,?)""",
-                    (persona_id, int(season["seasonId"]), int(season["division"]), now),
-                )
-            for tournament in OFFLINE_TOURNAMENTS:
-                connection.execute(
-                    """INSERT OR IGNORE INTO beta_offline_tournaments
-                    (persona_id,tournament_id,current_round,won,active,updated_at)
-                    VALUES (?,?,0,0,1,?)""",
-                    (persona_id, int(tournament["tournamentId"]), now),
-                )
+            self._seed_beta_persona_locked(connection, persona_id, now)
             # BETA 2.18 persisted the first-round pre-match tournamentData blob
             # as an "Underway" save even though progressData was only zero bytes.
             # Clear those stale markers once so reopening the cup starts fresh.
@@ -481,6 +456,49 @@ class BetaIdentityStore(LocalIdentityStore):
                 "INSERT OR REPLACE INTO schema_meta (meta_key, meta_value) VALUES ('beta_schema', ?)",
                 (BETA_SCHEMA,),
             )
+
+    def _seed_beta_persona_locked(
+        self, connection: sqlite3.Connection, persona_id: int, now: int
+    ) -> None:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO beta_accounts (
+                persona_id, account_uuid, discord_user_id, discord_username,
+                auth_state, created_at, last_seen, dnf_modifier
+            ) VALUES (?, ?, NULL, NULL, 'local-unlinked', ?, ?, 1.25)
+            """,
+            (persona_id, str(uuid.uuid4()), now, now),
+        )
+        connection.execute(
+            "UPDATE beta_accounts SET last_seen=? WHERE persona_id=?",
+            (now, persona_id),
+        )
+        for season in OFFLINE_SEASONS:
+            connection.execute(
+                """INSERT OR IGNORE INTO beta_offline_seasons
+                (persona_id,season_id,division,matches_played,points,won,draw,lost,trophies_won,active,updated_at)
+                VALUES (?,?,?,0,0,0,0,0,0,1,?)""",
+                (persona_id, int(season["seasonId"]), int(season["division"]), now),
+            )
+        for tournament in OFFLINE_TOURNAMENTS:
+            connection.execute(
+                """INSERT OR IGNORE INTO beta_offline_tournaments
+                (persona_id,tournament_id,current_round,won,active,updated_at)
+                VALUES (?,?,0,0,1,?)""",
+                (persona_id, int(tournament["tournamentId"]), now),
+            )
+
+    def _provision_persona(self, persona_id: int) -> None:
+        """Seed a freshly-created persona with seasons, tournaments, an
+        unlinked beta account and a starter club (REQ-4)."""
+        now = int(time.time())
+        with self._lock, closing(self._connect()) as connection, connection:
+            self._seed_beta_persona_locked(connection, persona_id, now)
+        set_client_persona(persona_id)
+        try:
+            self.ensure_beta_starter_club()
+        finally:
+            pass
 
     @staticmethod
     def _starter_requirements() -> list[str]:

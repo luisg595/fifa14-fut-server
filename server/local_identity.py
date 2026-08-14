@@ -5,6 +5,7 @@ import json
 import math
 import random
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -22,6 +23,31 @@ DEFAULT_SID = "LOCAL-FIFA14-SID"
 DEFAULT_PHISHING_TOKEN = "LOCAL-FIFA14-PHISHING"
 DEFAULT_FUT_ACTIONS = ("INTRO_DONE",)
 FUT_ACTION_PATTERN = re.compile(r"^[A-Z0-9_]{1,64}$")
+
+# BETA multi-account (Fase A): the server resolves each connected laptop to its
+# own persona via an explicit account key carried in the /ut/auth body
+# (identification.EASW-Session) and re-resolved on every request through the
+# X-UT-SID header.  The thread-local is set per request by the HTTP handler.
+DEFAULT_ACCOUNT_KEY = ""
+DEFAULT_EASW_SESSION = "LOCAL-FIFA14-EASW-SESSION"
+ACCOUNT_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,63}$")
+_CLIENT_CONTEXT = threading.local()
+
+
+def set_client_persona(persona_id: int | None) -> None:
+    if persona_id is None:
+        clear_client_persona()
+    else:
+        _CLIENT_CONTEXT.persona_id = int(persona_id)
+
+
+def get_client_persona() -> int | None:
+    return getattr(_CLIENT_CONTEXT, "persona_id", None)
+
+
+def clear_client_persona() -> None:
+    if hasattr(_CLIENT_CONTEXT, "persona_id"):
+        del _CLIENT_CONTEXT.persona_id
 
 PACK_CATALOG_PATH = Path(__file__).with_name("pack-catalog.v237.json")
 PACK_WEIGHTS_PATH = Path(__file__).with_name("pack-weights.v237.json")
@@ -160,15 +186,19 @@ class LocalIdentityStore:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS identity (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    persona_id INTEGER PRIMARY KEY,
                     nucleus_id INTEGER NOT NULL,
-                    persona_id INTEGER NOT NULL,
                     persona_name TEXT NOT NULL,
                     platform TEXT NOT NULL,
                     online_access INTEGER NOT NULL,
                     trusted INTEGER NOT NULL,
                     phishing_question INTEGER NOT NULL,
                     phishing_token TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS local_accounts (
+                    account_key TEXT PRIMARY KEY,
+                    persona_id INTEGER NOT NULL UNIQUE,
                     created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -378,22 +408,63 @@ class LocalIdentityStore:
                         (int(legacy["trade_id"]),),
                     )
 
+            # BETA multi-account (Fase A): the legacy identity table was keyed by
+            # a CHECK(singleton=1) primary key, which allowed exactly one persona.
+            # Migrate it to a persona_id-keyed multi-row layout, preserving the
+            # existing default persona row verbatim.  Idempotent: the new schema
+            # exposes no `singleton` column, so re-runs are no-ops.
+            identity_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(identity)").fetchall()}
+            if "singleton" in identity_columns:
+                has_multi = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='identity_multi'"
+                ).fetchone() is not None
+                if not has_multi:
+                    connection.executescript(
+                        """
+                        CREATE TABLE identity_multi (
+                            persona_id INTEGER PRIMARY KEY,
+                            nucleus_id INTEGER NOT NULL,
+                            persona_name TEXT NOT NULL,
+                            platform TEXT NOT NULL,
+                            online_access INTEGER NOT NULL,
+                            trusted INTEGER NOT NULL,
+                            phishing_question INTEGER NOT NULL,
+                            phishing_token TEXT NOT NULL,
+                            created_at INTEGER NOT NULL
+                        );
+                        INSERT INTO identity_multi (
+                            persona_id, nucleus_id, persona_name, platform,
+                            online_access, trusted, phishing_question, phishing_token,
+                            created_at
+                        ) SELECT persona_id, nucleus_id, persona_name, platform,
+                            online_access, trusted, phishing_question, phishing_token,
+                            created_at
+                        FROM identity;
+                        """
+                    )
+                connection.execute("DROP TABLE IF EXISTS identity")
+                connection.execute("ALTER TABLE identity_multi RENAME TO identity")
+
             connection.execute(
                 """
                 INSERT OR IGNORE INTO identity (
-                    singleton, nucleus_id, persona_id, persona_name, platform,
+                    persona_id, nucleus_id, persona_name, platform,
                     online_access, trusted, phishing_question, phishing_token,
                     created_at
-                ) VALUES (1, ?, ?, ?, 'pc', 1, ?, 0, ?, ?)
+                ) VALUES (?, ?, ?, 'pc', 1, ?, 0, ?, ?)
                 """,
                 (
-                    DEFAULT_NUCLEUS_ID,
                     DEFAULT_PERSONA_ID,
+                    DEFAULT_NUCLEUS_ID,
                     DEFAULT_PERSONA_NAME,
                     1 if initial_mode == "existing" else 0,
                     DEFAULT_PHISHING_TOKEN,
                     now,
                 ),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO local_accounts (account_key, persona_id, created_at) VALUES (?, ?, ?)",
+                (DEFAULT_ACCOUNT_KEY, DEFAULT_PERSONA_ID, now),
             )
             for manager in MANAGER_CATALOG_DOCUMENT.get("managers", []):
                 connection.execute(
@@ -420,7 +491,16 @@ class LocalIdentityStore:
             self._repair_active_squad_locked(connection, int(self._identity(connection)["persona_id"]))
 
     def _identity(self, connection: sqlite3.Connection) -> sqlite3.Row:
-        row = connection.execute("SELECT * FROM identity WHERE singleton = 1").fetchone()
+        persona_id = get_client_persona()
+        if persona_id is not None:
+            row = connection.execute(
+                "SELECT * FROM identity WHERE persona_id = ?", (int(persona_id),)
+            ).fetchone()
+            if row is not None:
+                return row
+        row = connection.execute(
+            "SELECT * FROM identity WHERE persona_id = ?", (DEFAULT_PERSONA_ID,)
+        ).fetchone()
         if row is None:
             raise RuntimeError("local identity database is not initialized")
         return row
@@ -492,9 +572,18 @@ class LocalIdentityStore:
             client_document = json.loads(client_payload.decode("utf-8")) if client_payload else {}
         except (UnicodeDecodeError, json.JSONDecodeError):
             client_document = {"rawHex": client_payload.hex()}
+        account_key = DEFAULT_ACCOUNT_KEY
+        identification = client_document.get("identification")
+        if isinstance(identification, dict):
+            easw_session = identification.get("EASW-Session")
+            if isinstance(easw_session, str):
+                easw_session = easw_session.strip()
+                if easw_session and easw_session != DEFAULT_EASW_SESSION and ACCOUNT_KEY_PATTERN.match(easw_session):
+                    account_key = easw_session
+        persona_id = self.resolve_persona(account_key)
         now = int(time.time())
+        sid = "P{}-{}".format(persona_id, secrets.token_hex(8))
         with self._lock, closing(self._connect()) as connection, connection:
-            identity = self._identity(connection)
             connection.execute(
                 """
                 INSERT INTO sessions (sid, persona_id, client_payload, created_at, last_seen)
@@ -505,14 +594,71 @@ class LocalIdentityStore:
                     last_seen = excluded.last_seen
                 """,
                 (
-                    DEFAULT_SID,
-                    identity["persona_id"],
+                    sid,
+                    persona_id,
                     json.dumps(client_document, separators=(",", ":"), sort_keys=True),
                     now,
                     now,
                 ),
             )
-        return DEFAULT_SID
+        set_client_persona(persona_id)
+        return sid
+
+    def resolve_persona(self, account_key: str = DEFAULT_ACCOUNT_KEY) -> int:
+        key = (account_key or "").strip()
+        if not ACCOUNT_KEY_PATTERN.match(key):
+            key = DEFAULT_ACCOUNT_KEY
+        now = int(time.time())
+        with self._lock, closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT persona_id FROM local_accounts WHERE account_key = ?", (key,)
+            ).fetchone()
+            if row is not None:
+                persona_id = int(row["persona_id"])
+                return persona_id
+            highest = connection.execute(
+                "SELECT COALESCE(MAX(persona_id), ?) FROM identity", (DEFAULT_PERSONA_ID,)
+            ).fetchone()
+            persona_id = int(highest[0]) + 1
+            if persona_id <= DEFAULT_PERSONA_ID:
+                persona_id = DEFAULT_PERSONA_ID + 1
+            persona_name = "LocalFUT-{}".format(key) if key else DEFAULT_PERSONA_NAME
+            connection.execute(
+                """
+                INSERT INTO identity (
+                    persona_id, nucleus_id, persona_name, platform,
+                    online_access, trusted, phishing_question, phishing_token,
+                    created_at
+                ) VALUES (?, ?, ?, 'pc', 1, 1, 0, ?, ?)
+                """,
+                (
+                    persona_id,
+                    persona_id,
+                    persona_name,
+                    DEFAULT_PHISHING_TOKEN,
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO local_accounts (account_key, persona_id, created_at) VALUES (?, ?, ?)",
+                (key, persona_id, now),
+            )
+        self._provision_persona(persona_id)
+        return persona_id
+
+    def persona_id_for_sid(self, sid: str | None) -> int | None:
+        if not sid:
+            return None
+        if str(sid) == DEFAULT_SID:
+            return DEFAULT_PERSONA_ID
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT persona_id FROM sessions WHERE sid = ?", (str(sid),)
+            ).fetchone()
+        return int(row["persona_id"]) if row is not None else None
+
+    def _provision_persona(self, persona_id: int) -> None:
+        """Hook for subclasses to seed a freshly-created persona (REQ-4)."""
 
     def _user_actions_locked(self, connection: sqlite3.Connection, persona_id: int) -> dict[str, bool]:
         rows = connection.execute(
@@ -628,7 +774,10 @@ class LocalIdentityStore:
     def validate_phishing_answer(self) -> dict[str, Any]:
         with self._lock, closing(self._connect()) as connection, connection:
             identity = self._identity(connection)
-            connection.execute("UPDATE identity SET trusted = 1 WHERE singleton = 1")
+            connection.execute(
+                "UPDATE identity SET trusted = 1 WHERE persona_id = ?",
+                (int(identity["persona_id"]),),
+            )
             token = identity["phishing_token"]
         return {
             "debug": "Answer is correct.",
@@ -657,19 +806,20 @@ class LocalIdentityStore:
         if not 1 <= len(club_abbr) <= 3:
             raise ValueError("club abbreviation must be between 1 and 3 characters")
         established = int(established if established is not None else time.time())
+        club_id = 1 if int(identity["persona_id"]) == DEFAULT_PERSONA_ID else int(identity["persona_id"])
         connection.execute(
             """
             INSERT INTO clubs (
                 club_id, persona_id, club_name, club_abbr, badge_id, team_id,
                 established, division_online, coins, fifa_points
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, 10, ?, 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 10, ?, 0)
             ON CONFLICT(persona_id) DO UPDATE SET
                 club_name = excluded.club_name,
                 club_abbr = excluded.club_abbr,
                 badge_id = excluded.badge_id,
                 team_id = excluded.team_id
             """,
-            (identity["persona_id"], club_name, club_abbr, int(badge_id), int(team_id), established, LOCAL_TEST_STARTING_COINS),
+            (club_id, identity["persona_id"], club_name, club_abbr, int(badge_id), int(team_id), established, LOCAL_TEST_STARTING_COINS),
         )
         row = connection.execute(
             "SELECT * FROM clubs WHERE persona_id = ?", (identity["persona_id"],)

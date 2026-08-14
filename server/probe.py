@@ -31,7 +31,15 @@ SERVER_DIRECTORY = Path(__file__).resolve().parent
 if str(SERVER_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SERVER_DIRECTORY))
 
-from local_identity import LocalIdentityStore, PLAYER_CATALOG, PLAYER_BY_ASSET, PLAYER_REFERENCE_BY_ASSET
+from local_identity import (
+    LocalIdentityStore,
+    PLAYER_CATALOG,
+    PLAYER_BY_ASSET,
+    PLAYER_REFERENCE_BY_ASSET,
+    set_client_persona,
+    get_client_persona,
+    clear_client_persona,
+)
 from beta_identity import BetaIdentityStore
 
 
@@ -2383,6 +2391,20 @@ class HttpProbe(BaseHTTPRequestHandler):
         )
         path_without_query = self.path.partition("?")[0]
         identity_store = getattr(self.server, "identity_store", None)
+        # BETA multi-account (Fase A): resolve the request's persona from the
+        # X-UT-SID header (REQ-6).  The client echoes the SID returned by
+        # /ut/auth on every subsequent request.  Requests without a known SID
+        # (health checks, the auth handshake itself) fall back to the default
+        # persona.
+        set_client_persona(None)
+        if identity_store is not None:
+            try:
+                sid_header = self.headers.get("X-UT-SID")
+                resolved = identity_store.persona_id_for_sid(sid_header)
+            except Exception:
+                resolved = None
+            if resolved is not None:
+                set_client_persona(resolved)
         effective_method = self.headers.get(
             "X-HTTP-Method-Override",
             self.command,
@@ -2852,6 +2874,23 @@ class HttpProbe(BaseHTTPRequestHandler):
                 body_text=auth_text,
                 body_hex=body.hex(),
             )
+            if identity_store is not None:
+                try:
+                    account_document = json.loads(auth_text) if auth_text else {}
+                except json.JSONDecodeError:
+                    account_document = {}
+                identification = account_document.get("identification") if isinstance(account_document, dict) else None
+                account_key = (
+                    str(identification.get("EASW-Session") or "")
+                    if isinstance(identification, dict)
+                    else ""
+                )
+                emit(
+                    "fut-ut-auth-account",
+                    sid=sid,
+                    account_key=account_key,
+                    persona_id=get_client_persona(),
+                )
             self.send_response(200)
             self.send_header("content-type", "application/json; charset=utf-8")
             self.send_header("cache-control", "no-store")
