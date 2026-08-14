@@ -1354,6 +1354,17 @@ def build_shared_blaze_bootstrap_response(
             0,
         )
     typed: dict[tuple[int, int], tuple[bytes, str, int]] = {
+        # UTIL_COMPONENT (9) - Store/purchase related commands observed during pack purchase gaps
+        (UTIL_COMPONENT, 4): (
+            tdf_u32(b"STAT", 0) + tdf_bool(b"OK", True),
+            "util-store-welcome-header",
+            0,
+        ),
+        (UTIL_COMPONENT, 10): (
+            tdf_u32(b"STAT", 0) + tdf_bool(b"OK", True),
+            "util-first-time-flag",
+            0,
+        ),
         (MESSAGING_COMPONENT, 2): (
             tdf_u32(b"MCNT", 0),
             "messaging-fetch-count",
