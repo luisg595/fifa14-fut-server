@@ -2392,7 +2392,10 @@ class HttpProbe(BaseHTTPRequestHandler):
             method=self.command,
             path=self.path,
             headers=dict(self.headers.items()),
-            body_hex=body.hex(),
+            # Only the leading bytes are logged so huge bodies (e.g. the
+            # match-assets report) do not bloat the container log to MB/line.
+            body_len=len(body),
+            body_hex=body[:512].hex(),
         )
         path_without_query = self.path.partition("?")[0]
         identity_store = getattr(self.server, "identity_store", None)
