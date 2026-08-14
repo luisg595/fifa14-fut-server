@@ -1800,6 +1800,14 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                 if shared_response is None:
                     body = b""
                     response_name = "empty-success-observation"
+                    emit(
+                        "blaze-unhandled-command",
+                        peer=self.client_address,
+                        request_index=request_index,
+                        component=component,
+                        command=command,
+                        payload_hex=frame[12:64].hex(),
+                    )
                 else:
                     body, response_name, response_error = shared_response
 
