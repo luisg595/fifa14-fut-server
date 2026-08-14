@@ -1775,6 +1775,14 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                 body = b""
                 response_name = "authentication-logout"
             else:
+                if component == EASFC_COMPONENT:
+                    emit(
+                        "easfc-command-debug",
+                        peer=self.client_address,
+                        request_index=request_index,
+                        command=command,
+                        payload_hex=frame[12:64].hex(),
+                    )
                 if component == EASFC_COMPONENT and command in {1, 2, 3, 4}:
                     identity_store = getattr(self.server, "identity_store", None)
                     if identity_store is not None and hasattr(identity_store, "record_easfc_signal"):
