@@ -7,7 +7,7 @@ services:
     ports:
       - "0.0.0.0:42129:42129"   # redirector TLS
       - "0.0.0.0:42128:42128"   # main Blaze
-      - "0.0.0.0:8081:8080"     # http bootstrap
+      - "0.0.0.0:8080:8080"     # http bootstrap
       - "0.0.0.0:8099:8099"     # FUT HTTP (health/admin/ca/upload también aquí)
       - "0.0.0.0:8306:8306"     # dynamic messages
       - "0.0.0.0:44125:44125"   # GOSCA
