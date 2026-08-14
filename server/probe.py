@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
+UPLOAD_MATCH_ASSETS_PATH = "/__fifa14_local_fut_upload_match_assets"
 SERVER_DIRECTORY = Path(__file__).resolve().parent
 if str(SERVER_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SERVER_DIRECTORY))
@@ -2378,7 +2379,11 @@ class HttpProbe(BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         length = int(self.headers.get("content-length", "0"))
-        body = self.rfile.read(min(length, 1_048_576)) if length else b""
+        path_only = self.path.partition("?")[0]
+        # Match-assets reports exceed the 1 MiB generic cap; read their body in
+        # full so the uploaded document is never truncated into invalid JSON.
+        body_cap = 64 * 1024 * 1024 if path_only == UPLOAD_MATCH_ASSETS_PATH else 1_048_576
+        body = self.rfile.read(min(length, body_cap)) if length else b""
         emit(
             "http-probe",
             name=getattr(self.server, "probe_name", "http"),
@@ -2475,7 +2480,7 @@ class HttpProbe(BaseHTTPRequestHandler):
                 emit("v237-ca-response", path=self.path, status=200, bytes=len(payload))
         elif (
             probe_name == "fut-http"
-            and path_without_query == "/__fifa14_local_fut_upload_match_assets"
+            and path_without_query == UPLOAD_MATCH_ASSETS_PATH
             and effective_method == "POST"
         ):
             admin_secret = str(getattr(self.server, "admin_secret", ""))
@@ -2493,6 +2498,15 @@ class HttpProbe(BaseHTTPRequestHandler):
                 self.send_header("connection", "close")
                 emit("v237-upload-match-assets", path=self.path, status=400, bytes=0)
             else:
+                try:
+                    json.loads(body)
+                except (ValueError, UnicodeDecodeError) as error:
+                    payload = build_fut_json_payload({"error": "invalid-json", "detail": str(error)})
+                    self.send_response(400)
+                    self.send_header("content-type", "application/json; charset=utf-8")
+                    self.send_header("connection", "close")
+                    emit("v237-upload-match-assets", path=self.path, status=400, error=str(error), bytes=len(body))
+                    return
                 report_path = SERVER_DIRECTORY.parent / "artifacts" / "fifa14-match-assets-v2411-beta222.json"
                 try:
                     report_path.parent.mkdir(parents=True, exist_ok=True)
