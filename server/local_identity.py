@@ -580,6 +580,11 @@ class LocalIdentityStore:
                 easw_session = easw_session.strip()
                 if easw_session and easw_session != DEFAULT_EASW_SESSION and ACCOUNT_KEY_PATTERN.match(easw_session):
                     account_key = easw_session
+        # No-default-login: an empty/sentinel EASW-Session must never resolve to
+        # the default persona. Every launch must carry an explicit username so
+        # each person reaches only their own account.
+        if not account_key or account_key == DEFAULT_EASW_SESSION:
+            raise ValueError("account-key-required: enter your username to log in")
         persona_id = self.resolve_persona(account_key)
         now = int(time.time())
         sid = "P{}-{}".format(persona_id, secrets.token_hex(8))

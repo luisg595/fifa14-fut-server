@@ -2908,11 +2908,32 @@ class HttpProbe(BaseHTTPRequestHandler):
             getattr(self.server, "probe_name", "http") == "fut-http"
             and path_without_query == "/ut/auth"
         ):
-            sid = (
-                identity_store.start_session(body)
-                if identity_store is not None
-                else "LOCAL-FIFA14-SID"
-            )
+            try:
+                sid = (
+                    identity_store.start_session(body)
+                    if identity_store is not None
+                    else "LOCAL-FIFA14-SID"
+                )
+            except ValueError as error:
+                # No-default-login: block the auth handshake when no username
+                # was supplied. A SID must never resolve to the default persona.
+                payload = build_fut_json_payload({
+                    "error": "account-key-required",
+                    "detail": str(error),
+                })
+                self.send_response(401)
+                self.send_header("content-type", "application/json; charset=utf-8")
+                self.send_header("cache-control", "no-store")
+                self.send_header("connection", "close")
+                emit(
+                    "fut-ut-auth-rejected",
+                    method=self.command,
+                    path=self.path,
+                    status=401,
+                    reason="account-key-required",
+                    error=str(error),
+                )
+                return
             response_document = build_fut_auth_response(sid)
             payload = build_fut_json_payload(response_document)
             try:
