@@ -113,6 +113,24 @@ continuo (H1) es del **lado cliente**; H3 y el logging son del **lado server**.
   reemplazando el intento `4971408` que rompió el login ("need proper TDF
   structures", revertido en `28b32f2`).
 
+## Verificación en runtime (resultado)
+
+**Confirmado en juego: sin lag ni pegado en ninguna parte.** Prueba de apertura
+de sobres simultánea en ambas PC completada sin problemas. Veredicto por
+hipótesis:
+
+- **H1 — confirmada.** El trace match-bridge + hooks siempre-activos en el
+  helper Frida del cliente estallaban en el hilo de render/red. PARITY-1
+  (trace off por defecto, telemetría tras `--diagnose`) lo resolvió.
+- **H2 — resuelta sin tocar TDF.** El gap de packs de 17-19 s desapareció al
+  quitar el overhead (PARITY-1/3/4). El deep-dive de UTIL 9/4-9/10 no fue
+  necesario; queda documentado por si un runtime futuro lo reabre.
+- **H3 — mitigada.** `TCP_NODELAY` (PARITY-3) elimina el efecto
+  Nagle/delayed-ACK de la NIC real en sockets Blaze/HTTP.
+
+Commits: `fifa14-fut-client` v2.40.11 (`146bf22`, PARITY-1) y
+`fifa14-fut-server` (`9c7a4f7`, PARITY-3/4 + spec).
+
 ## Escenarios de verificación (sin tocar código)
 
 - **SC-1.** Correlacionar en `frida.log` los bursts de `cards-match-bridge-*` con
