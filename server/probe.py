@@ -1775,7 +1775,7 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                 body = b""
                 response_name = "authentication-logout"
             else:
-                if component == EASFC_COMPONENT:
+                if component == EASFC_COMPONENT and getattr(self.server, "debug_logging", False):
                     emit(
                         "easfc-command-debug",
                         peer=self.client_address,
@@ -1800,14 +1800,15 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                 if shared_response is None:
                     body = b""
                     response_name = "empty-success-observation"
-                    emit(
-                        "blaze-unhandled-command",
-                        peer=self.client_address,
-                        request_index=request_index,
-                        component=component,
-                        command=command,
-                        payload_hex=frame[12:64].hex(),
-                    )
+                    if getattr(self.server, "debug_logging", False):
+                        emit(
+                            "blaze-unhandled-command",
+                            peer=self.client_address,
+                            request_index=request_index,
+                            component=component,
+                            command=command,
+                            payload_hex=frame[12:64].hex(),
+                        )
                 else:
                     body, response_name, response_error = shared_response
 
@@ -4556,6 +4557,17 @@ class ReuseThreadingTCPServer(socketserver.ThreadingTCPServer):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         return super().server_bind()
 
+    def get_request(self):
+        # Remote parity: the all-in-one local server ran on loopback, where the
+        # stack does not apply Nagle/delayed-ACK the way a real NIC does. Small
+        # Blaze frames over LAN must not wait for delayed-ACK.
+        sock, addr = super().get_request()
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        return sock, addr
+
 
 def certificate_hash(name: str):
     if name == "sha1":
@@ -4947,6 +4959,16 @@ class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         return super().server_bind()
 
+    def get_request(self):
+        # Remote parity: disable Nagle on accepted HTTP sockets so chatty FUT
+        # requests are not held for delayed-ACK on the real NIC.
+        sock, addr = super().get_request()
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        return sock, addr
+
 
 class TlsThreadingHTTPServer(ExclusiveThreadingHTTPServer):
     def __init__(self, server_address, request_handler_class, ssl_context):
@@ -4970,6 +4992,11 @@ def main() -> int:
         "(CA download, match-assets upload, give_coins). Empty disables auth.",
     )
     parser.add_argument("--instance-token", default="", help="Per-launch ownership token used by the PowerShell launcher")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Emit per-command Blaze debug logs (easfc-command-debug / blaze-unhandled-command). Off by default for local parity.",
+    )
     parser.add_argument("--blaze-port", type=int, default=42127)
     parser.add_argument("--main-blaze-port", type=int, default=42128)
     parser.add_argument("--http-port", type=int, default=8080)
@@ -5088,6 +5115,7 @@ def main() -> int:
     main_blaze.origin_login_delay_ms = max(0, args.origin_login_delay_ms)
     main_blaze.login_notification_delay_ms = max(0, args.login_notification_delay_ms)
     main_blaze.enable_fut_direct_boot_config = args.enable_fut_direct_boot_config
+    main_blaze.debug_logging = args.debug
     http = ExclusiveThreadingHTTPServer((args.host, args.http_port), HttpProbe)
     http.probe_name = "bootstrap-http"
     fut_http = ExclusiveThreadingHTTPServer((args.host, args.fut_http_port), HttpProbe)
