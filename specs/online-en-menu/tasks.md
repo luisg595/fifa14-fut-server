@@ -74,10 +74,19 @@
 
 ## 6. Contingencia H3 (si SC-A2 falla)
 
-- [ ] Documentar qué señal falta (OSDK / `division_online` / entitlements /
-      config de cliente) y el plan del parche de disco del cliente (analogía
-      `patch_fifa14_fut_dynamic_route.py`).
-- [ ] NO continuar al emparejamiento activo hasta resolver el bloqueo.
+- [x] Documentar qué señal falta (OSDK / `division_online` / entitlements /
+      config de cliente) y el plan del parche del cliente (analogía
+      `patch_fifa14_fut_dynamic_route.py`). Hallazgos en `spec.md` §H3:
+      el indicador es del shell (capa EASW); Fase 1 agotada (STAS,
+      `lastOnlineTime`, claves `EASW/ENABLED`+`OSDK_EASW_*_URL` — el juego
+      nunca diala EASW); `fifa14.exe` empaquetado/cifrado → hook en runtime
+      (Frida) sobre el imagen descifrado para forzar `EASW_STATE=CONNECTED`.
+- [x] NO continuar al emparejamiento activo hasta resolver el bloqueo.
+- [ ] Siguiente (H3): localizar en runtime el writer del estado de conexión
+      del shell (xrefs en memoria a `fifamessages::ConnectedToServers` /
+      `EASW_STATE`) y probar el hook Frida que fuerza
+      `EASW_STATE=CONNECTED`; verificar el indicador Online arriba a la
+      derecha en ambas PCs.
 
 ## 7. Cierre
 

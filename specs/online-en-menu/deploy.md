@@ -63,8 +63,18 @@ de cada PC, capturas de pantalla del menú.
 ## 5. Si SC-A2 falla (H3)
 
 Parar. Documentar qué señal falta (OSDK / `division_online` / entitlements /
-config de cliente) y el plan del parche de disco del cliente (analogía
+config de cliente) y el plan del parche del cliente (analogía
 `patch_fifa14_fut_dynamic_route.py`). No continuar al emparejamiento activo.
+
+**Estado verificado (2026-08-19):** SC-A2 falló. Los 3 experimentos de la
+Fase 1 (`persona_status=1` en `bddc524`, `lastOnlineTime=now` en `3432927`,
+claves `EASW/ENABLED`+`OSDK_EASW_*_URL` en `a5be17c`) fueron desplegados por
+el usuario y todos negativos: el indicador sigue "sin conexión a EAS FC" y el
+juego nunca dialó EASW (no hay `easw-http-request` en `docker compose logs`).
+El indicador lo decide la capa EASW del shell (sesión null) y `fifa14.exe`
+está empaquetado/cifrado, así que el plan del cliente es un hook Frida en
+runtime sobre el imagen descifrado que fuerce `EASW_STATE=CONNECTED`. Detalle
+en `spec.md` §H3.
 
 ## 6. Regresión offline
 

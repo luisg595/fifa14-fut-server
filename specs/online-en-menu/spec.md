@@ -117,8 +117,39 @@ se activa ni se prueba** en esta fase salvo que SC-A2 se cumpla.
   persona), `fut-online-seasons-beta2`, `matchmaking-queue-join`.
 - **REQ-8** Si SC-A2 falla → **contingencia H3**: documentar qué señal falta
   (OSDK / `division_online` / entitlements / config de cliente) y el plan del
-  parche de disco del cliente (analogía `patch_fifa14_fut_dynamic_route.py`).
-  No continuar al emparejamiento activo hasta resolverlo.
+  parche del cliente (analogía `patch_fifa14_fut_dynamic_route.py`, que
+  patchea `data1.big/data1.bh`, no el exe). No continuar al emparejamiento
+  activo hasta resolverlo.
+
+### H3 — Hallazgos (verificado, 2026-08-18/19)
+
+- **El indicador "sin conexión a EAS FC" es del shell (capa EASW), no de FUT.**
+  El componente Blaze `EASFC` (0x081D) y el dial HTTPS/443/EASW **nunca se
+  producen** en sesión ni en la referencia (redirect-probe solo diala
+  42129/8080/8099). El shell marca el estado desde su sesión EASW, que es
+  **null** (el tracer ya inyecta EASW-Session/Token falsos en el body CAS:
+  `AUTH_EASW_SESSION_NULL_CHECK_RVA=0x0015f2b4`).
+- **Fase 1 agotada (3 experimentos, todos negativos, sin regresión offline):**
+  1. `persona_status=1` (STAS) en OriginLogin (`bddc524`) — sin cambio.
+  2. `lastOnlineTime=now` en `/ut/auth` (`3432927`) — sin cambio.
+  3. Claves `EASW/ENABLED=1` + `OSDK_EASW_*_URL` apuntando al server local +
+     handlers `easw-*` en fut-http (`a5be17c`) — el juego **ni dialó** EASW
+     (`easw-http-request` ausente en logs). La capa EASW del shell no se
+     activa por config; su estado lo decide el código del cliente.
+- **`fifa14.exe` está cifrado/empaquetado en disco** (el tracer lo llama
+  "decrypted fifa14.exe"): `.text` raw 0x1749a00 → virt 0x3829000, EP en
+  `jmp [ptr]`, entropía ~8, **0 xrefs estáticos** a las cadenas EASW
+  (`fifamessages::ConnectedToServers`, `EASW_STATE`,
+  `%s/personas/%u/sku/%s/onlineStatus`, `isonline`, `EASW/ENABLED`). El
+  código real solo existe en runtime tras el unpacking.
+- **Implicación para el parche**: NO es viable patchear el exe en disco
+  (analogía `patch_fifa14_fut_dynamic_route.py` patchea `data1.big`, que sí
+  está plano). El camino del cliente es un **hook en runtime** (Frida) sobre
+  el imagen ya descifrado, en la misma línea que los RVAs+signatures
+  existentes del tracer (`AUTH_RESPONSE_KEY_MAPPER_RVA=0x0017eb00`,
+  `CA_FUNCTION_RVA`, etc.), localizando el writer del estado de conexión del
+  shell (xrefs en memoria a `fifamessages::ConnectedToServers` /
+  `EASW_STATE`) y forzando `EASW_STATE=CONNECTED`.
 
 ## Escenarios
 
