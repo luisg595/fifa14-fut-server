@@ -343,6 +343,15 @@ class LocalIdentityStore:
                     sold_price INTEGER NOT NULL,
                     sold_at INTEGER NOT NULL
                 );
+                -- Blaze identity resolution (Fase 0a): maps a LAN client IP to
+                -- exactly one persona. persona_id is the primary key because the
+                -- assumption is 1 persona = 1 PC; if a persona moves to a
+                -- different PC the row is updated, not re-inserted.
+                CREATE TABLE IF NOT EXISTS client_ips (
+                    persona_id INTEGER PRIMARY KEY,
+                    client_ip TEXT NOT NULL UNIQUE,
+                    updated_at INTEGER NOT NULL
+                );
                 """
             )
             # BETA 2.8: existing progression databases predate the native squad
@@ -572,7 +581,7 @@ class LocalIdentityStore:
             }
             return {"userAccountInfo": {"personas": [persona]}}
 
-    def start_session(self, client_payload: bytes = b"") -> str:
+    def start_session(self, client_payload: bytes = b"", client_ip: str = "") -> str:
         try:
             client_document = json.loads(client_payload.decode("utf-8")) if client_payload else {}
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -591,6 +600,11 @@ class LocalIdentityStore:
         if not account_key or account_key == DEFAULT_EASW_SESSION:
             raise ValueError("account-key-required: enter your username to log in")
         persona_id = self.resolve_persona(account_key)
+        # Fase 0a redundant binding: the /ut/auth handshake also records the
+        # client IP so Blaze can resolve identity even if the launcher bind
+        # missed a launch.
+        if client_ip:
+            self.bind_client_ip(persona_id, client_ip)
         now = int(time.time())
         sid = "P{}-{}".format(persona_id, secrets.token_hex(8))
         with self._lock, closing(self._connect()) as connection, connection:
@@ -683,6 +697,51 @@ class LocalIdentityStore:
 
     def _provision_persona(self, persona_id: int) -> None:
         """Hook for subclasses to seed a freshly-created persona (REQ-4)."""
+
+    def bind_client_ip(self, persona_id: int, client_ip: str) -> None:
+        """Record the LAN client IP that resolves to ``persona_id``.
+
+        One persona maps to one PC. If the persona already has a recorded IP
+        the row is updated (a persona moving to another PC must not create a
+        duplicate binding).
+        """
+        persona_id = int(persona_id)
+        now = int(time.time())
+        with self._lock, closing(self._connect()) as connection, connection:
+            # The connecting IP wins: if another persona currently owns this
+            # client_ip (e.g. an earlier smoke test or a persona that moved
+            # machines), free it before (re)associating. 1 persona = 1 PC.
+            connection.execute(
+                "DELETE FROM client_ips WHERE client_ip = ?", (client_ip,)
+            )
+            connection.execute(
+                """
+                INSERT INTO client_ips (persona_id, client_ip, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(persona_id) DO UPDATE SET
+                    client_ip = excluded.client_ip,
+                    updated_at = excluded.updated_at
+                """,
+                (persona_id, client_ip, now),
+            )
+
+    def persona_id_for_client_ip(self, client_ip: str) -> int | None:
+        """Resolve a LAN client IP to its bound persona, without creating one."""
+        if not client_ip:
+            return None
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT persona_id FROM client_ips WHERE client_ip = ?", (client_ip,)
+            ).fetchone()
+        return int(row["persona_id"]) if row is not None else None
+
+    def persona_name_for_id(self, persona_id: int) -> str | None:
+        """Return the stored persona display name, or None if unknown."""
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT persona_name FROM identity WHERE persona_id = ?", (int(persona_id),)
+            ).fetchone()
+        return str(row["persona_name"]) if row is not None else None
 
     def _user_actions_locked(self, connection: sqlite3.Connection, persona_id: int) -> dict[str, bool]:
         rows = connection.execute(

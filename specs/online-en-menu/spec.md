@@ -12,9 +12,10 @@ online entre 2 PCs.
 stash `stash@{0}` = `b38406e` de `fifa14-fut-server` (rama borrada
 `feat/fase0a-identidad-blaze-por-persona`). Esta spec cubre:
 
-1. **Integración**: rescatar el trabajo online del stash a una rama real
-   (`feat/online-en-menu`), fusionarla con `main` (multi-squad) resolviendo
-   conflictos y subirla a origin (el PR/merge final lo hace el usuario).
+1. **Integración**: la rama `feat/online-en-menu` sale de `main` (multi-squad);
+   el trabajo online del stash se integra en ella como **un único commit**
+   (`git merge --squash b38406e`) resolviendo conflictos y subiendo la rama a
+   origin (el PR/merge final lo hace el usuario).
 2. **Cliente**: registrar la IP de cada PC (`bind_client`) desde el launcher
    antes de abrir el juego, para que Blaze resuelva la identidad de cada persona.
 3. **Verificación**: confirmar el conjunto de señales de "online" del backend
@@ -88,9 +89,11 @@ se activa ni se prueba** en esta fase salvo que SC-A2 se cumpla.
 
 ## Requerimientos
 
-- **REQ-1** Crear rama `feat/online-en-menu` desde `b38406e` y mergear `main`
-  en ella. Resolver conflictos conservando **ambos** trabajos (multi-squad de
-  main + online del stash) y **todos** los archivos `dev/*` de main.
+- **REQ-1** Rama `feat/online-en-menu` creada desde `main`. Integrar el trabajo
+  online del stash (`b38406e`) como **un único commit** (`git merge --squash
+  b38406e`), resolviendo conflictos y conservando **ambos** trabajos
+  (multi-squad de main + online del stash) y **todos** los archivos `dev/*` de
+  main.
 - **REQ-2** Verificar que la rama integrada compila y arranca: `py_compile` de
   `server/*.py` + smoke `--beta-mode` que sirva offline seasons intactas,
   online seasons (11 records, división 11 provisional) y multi-squad sin

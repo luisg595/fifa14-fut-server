@@ -350,6 +350,11 @@ TDF_OBJECT_ID = 0x9
 # client ask for its normal post-login OSDK bootstrap instead of being limited
 # to the small observation-only component set used by the first probe.
 AUTHENTICATION_COMPONENT = 1
+# Blaze::Matchmaking (FIFA 14 component 4). Command 13 = JoinQueue, command
+# 14 = LeaveQueue. The client's Season Online flow submits a full criteria
+# document (decoded in spec) plus its own PNET (LAN IP + port) that the server
+# uses to pair opponents.
+MATCHMAKING_COMPONENT = 4
 STATS_COMPONENT = 7
 CENSUS_COMPONENT = 10
 CLUBS_COMPONENT = 11
@@ -853,6 +858,127 @@ def extract_tdf_varint_last(payload: bytes, tag: bytes) -> int | None:
     return value
 
 
+def extract_matchmaking_key(payload: bytes) -> tuple[int, int, str, int]:
+    """Recover the client's queue signature from a Blaze Matchmaking JoinQueue body.
+
+    The client's criteria document cannot be decoded with ``decode_tdf_document``
+    (its root opens with type 0x09 BTPL), so each key field is located by its
+    encoded tag marker and read directly. ``fifaMatchupHash`` lives inside the
+    RLST criteria list as a NAME/VALU pair; we scan for the NAME string and read
+    the following VALU varint.
+    """
+    mode = extract_tdf_u32(payload, b"MODE") or 0
+    gset = extract_tdf_u32(payload, b"GSET") or 0
+    gver = extract_tdf_string(payload, b"GVER") or ""
+    matchup_hash = 0
+    name_marker = tdf_string(b"NAME", "fifaMatchupHash")
+    name_at = payload.find(name_marker)
+    if name_at >= 0:
+        valu_marker = tdf_tag(b"VALU", TDF_VAR_INT)
+        valu_at = payload.find(valu_marker, name_at)
+        if valu_at >= 0:
+            try:
+                matchup_hash, _ = read_tdf_varint(payload, valu_at + len(valu_marker))
+            except ValueError:
+                matchup_hash = 0
+    return mode, gset, gver, matchup_hash
+
+
+def extract_matchmaking_pnet(payload: bytes) -> dict | None:
+    """Recover the client's own PNET (LAN IP + port) from a JoinQueue body.
+
+    ``PNET`` is a TDF tagged union (type 6): one active-member byte then a
+    single field group (INIP/EXIP) holding IP (varint), MACI, and PORT. Values
+    are read directly after the tag marker so a partially-known schema cannot
+    fail the whole join.
+    """
+    marker = tdf_tag(b"PNET", TDF_TAGGED_UNION)
+    position = payload.find(marker)
+    if position < 0 or position + len(marker) + 1 > len(payload):
+        return None
+    try:
+        active_member = payload[position + len(marker)]
+    except IndexError:
+        return None
+    tail = payload[position:]
+    ip = extract_tdf_u32(tail, b"IP")
+    port = extract_tdf_u32(tail, b"PORT")
+    if ip is None and port is None:
+        return None
+    return {
+        "active_member": active_member,
+        "ip": ip,
+        "port": port,
+    }
+
+
+def build_matchmaking_join_queue_response(payload: bytes) -> bytes:
+    """Experiment (Paso 3b / R15): echo the inferred root schema for the
+    Matchmaking.JoinQueue response so the client actually parses a real body.
+
+    The client stays in the search spinner while the server answers ``b""``
+    (R15: ``consumeBlazeFrames`` captured the empty response and the client
+    never reached its TDF parser). This body echoes the root-level fields the
+    request already carries (TID/QCAP/NTOP/PNET/RNFO/DUR/BTPL) with the same
+    encodings so the response is decodable; the frida hook on the TID parser
+    (rva ``0x478c006``) then dumps the fields the client actually reads.
+    """
+    tid = extract_tdf_u32(payload, b"TID") or 65534
+    qcap = extract_tdf_u32(payload, b"QCAP") or 0
+    ntop = extract_tdf_u32(payload, b"NTOP") or 0
+    dur = extract_tdf_u32(payload, b"DUR") or 60000
+    pnet = extract_matchmaking_pnet(payload)
+    pnet_bytes = b""
+    if pnet is not None:
+        active_member = pnet.get("active_member")
+        if active_member is None:
+            active_member = 0x7F
+        if active_member != 0x7F:
+            ip = pnet.get("ip") or 0
+            port = pnet.get("port") or 0
+            member_group = (
+                tdf_u32(b"IP", ip)
+                + tdf_u16(b"PORT", port)
+                + tdf_tag(b"MACI", TDF_BLOB)
+                + tdf_varint(6)
+                + b"\x00" * 6
+            )
+            pnet_bytes = (
+                tdf_tag(b"PNET", TDF_TAGGED_UNION)
+                + bytes([active_member])
+                + tdf_group(b"INIP", member_group)
+            )
+    return (
+        tdf_u32(b"TID", tid)
+        + tdf_u32(b"QCAP", qcap)
+        + tdf_u32(b"NTOP", ntop)
+        + tdf_u32(b"DUR", dur)
+        + tdf_empty_map(b"BTPL", TDF_OBJECT_TYPE, TDF_OBJECT_TYPE)
+        + tdf_group(b"RNFO", b"")
+        + pnet_bytes
+    )
+
+
+def purge_matchmaking_peer(server: object, peer) -> int:
+    """Remove every queue entry bound to a disconnected client peer.
+
+    The Blaze connection may drop without a LeaveQueue (command 14), so each
+    session teardown removes any entries this peer left behind.
+    """
+    queue = getattr(server, "matchmaking_queue", None)
+    queue_lock = getattr(server, "matchmaking_lock", None)
+    if queue is None or queue_lock is None:
+        return 0
+    peer_address = tuple(peer) if peer is not None else None
+    removed = 0
+    with queue_lock:
+        for entries in queue.values():
+            before = len(entries)
+            entries[:] = [item for item in entries if item.get("peer") != peer_address]
+            removed += before - len(entries)
+    return removed
+
+
 def build_game_reporting_result_notification_body(game_reporting_id: int = 0) -> bytes:
     """Minimal Blaze::GameReporting::ResultNotification terminal-success body."""
     safe_id = max(0, int(game_reporting_id))
@@ -1327,6 +1453,8 @@ def build_shared_blaze_bootstrap_response(
     component: int,
     command: int,
     request_payload: bytes | None = None,
+    *,
+    persona_id: int = 1_000_001,
 ) -> tuple[bytes, str, int] | None:
     """Build typed FIFA 14 OSDK/CardHouse responses shared by PC and Xbox.
 
@@ -1349,7 +1477,7 @@ def build_shared_blaze_bootstrap_response(
         # authorize CardsDLL, which leaves the shell on its spinner.
         entitlement_tags = tuple("FIFA14PCFUTContentUnlocks" for _ in groups)
         return (
-            build_entitlements_body(entitlement_tags, group_names=groups),
+            build_entitlements_body(entitlement_tags, group_names=groups, persona_id=persona_id),
             "authentication-list-entitlements",
             0,
         )
@@ -1622,19 +1750,48 @@ class BlazeProbe(socketserver.BaseRequestHandler):
         origin_variant = "reference-local"
         origin_login_attempts = 0
         login_notifications_sent = False
+        # Fase 0a: resolve identity from the client LAN IP once per connection.
+        # The launcher (or the /ut/auth redundancy) records this mapping, so the
+        # very first OriginLogin of each PC already resolves to its persona.
+        client_ip = self.client_address[0] if self.client_address else ""
+        identity_store = getattr(self.server, "identity_store", None)
+        persona_id = 1_000_001
+        display_name = "LocalFUT"
+        if (
+            identity_store is not None
+            and hasattr(identity_store, "persona_id_for_client_ip")
+            and client_ip
+        ):
+            resolved = identity_store.persona_id_for_client_ip(client_ip)
+            if resolved is not None:
+                persona_id = resolved
+                set_client_persona(persona_id)
+                if hasattr(identity_store, "persona_name_for_id"):
+                    stored_name = identity_store.persona_name_for_id(persona_id)
+                    if stored_name:
+                        display_name = stored_name
+        emit(
+            "blaze-identity",
+            peer=self.client_address,
+            persona_id=persona_id,
+            display_name=display_name,
+        )
         for request_index in range(64):
             try:
                 frame = recv_fire_frame(self.request)
             except (OSError, TimeoutError) as error:
+                purged = purge_matchmaking_peer(self.server, self.client_address)
                 emit(
                     "blaze-session-ended",
                     peer=self.client_address,
                     requests=request_index,
                     error=str(error),
+                    matchmaking_purged=purged,
                 )
                 return
             if not frame:
-                emit("blaze-session-ended", peer=self.client_address, requests=request_index, error=None)
+                purged = purge_matchmaking_peer(self.server, self.client_address)
+                emit("blaze-session-ended", peer=self.client_address, requests=request_index, error=None, matchmaking_purged=purged)
                 return
 
             header = parse_fire_header(frame)
@@ -1681,11 +1838,12 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                     origin_first_login = bool(getattr(self.server, "origin_first_login", False))
                     if origin_variant == "pocket-relay-origin":
                         body = build_origin_login_body(
-                            player_id=1_000_001,
+                            player_id=persona_id,
                             # Match the reference Pocket Relay OriginLogin
                             # identity exactly: account, persona, and user ID
                             # are one stable local player.
-                            user_id=1_000_001,
+                            user_id=persona_id,
+                            display_name=display_name,
                             email="local@fifa14.invalid",
                             session_token="LOCAL-FIFA14-SESSION",
                             session_key="F4241",
@@ -1695,6 +1853,8 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                         )
                     elif origin_variant == "legacy-empty":
                         body = build_origin_login_body(
+                            player_id=persona_id,
+                            display_name=display_name,
                             email="local@fifa14.invalid",
                             session_token="",
                             session_key="",
@@ -1703,6 +1863,8 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                         )
                     elif origin_variant == "echo-origin":
                         body = build_origin_login_body(
+                            player_id=persona_id,
+                            display_name=display_name,
                             email="local@fifa14.invalid",
                             session_token=origin_token,
                             session_key="",
@@ -1710,7 +1872,11 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                             is_first_login=origin_first_login,
                         )
                     else:
-                        body = build_origin_login_body(is_first_login=origin_first_login)
+                        body = build_origin_login_body(
+                            player_id=persona_id,
+                            display_name=display_name,
+                            is_first_login=origin_first_login,
+                        )
                     decoded_login = validate_origin_login_body(body)
                     response_name = f"authentication-origin-login-{origin_variant}"
                     emit(
@@ -1769,11 +1935,85 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                 body = build_ping_body()
                 response_name = "util-ping"
             elif component == 9 and command == 8:
-                body = build_post_auth_body()
+                body = build_post_auth_body(player_id=persona_id)
                 response_name = "util-post-auth"
             elif component == 1 and command == 0x46:
                 body = b""
                 response_name = "authentication-logout"
+            elif component == MATCHMAKING_COMPONENT and command == 13:
+                # Fase 1 (matchmaking remoto): JoinQueue. Record the player in
+                # the in-memory queue keyed by their queue signature and keep
+                # the response body empty (F3 unresolved) so the observed
+                # client behaviour is preserved until the expected schema is
+                # known. The pairing itself (reply + notification of the
+                # opponent's PNET) is 3b, gated on F3.
+                payload = frame[12:]
+                mode, gset, gver, matchup_hash = extract_matchmaking_key(payload)
+                pnet = extract_matchmaking_pnet(payload)
+                queue_key = (mode, gset, gver, matchup_hash)
+                queue = getattr(self.server, "matchmaking_queue", None)
+                queue_lock = getattr(self.server, "matchmaking_lock", None)
+                entry = None
+                if queue is not None and queue_lock is not None:
+                    with queue_lock:
+                        entries = queue.setdefault(queue_key, [])
+                        entry = {
+                            "persona_id": persona_id,
+                            "display_name": display_name,
+                            "peer": self.client_address,
+                            "pnet": pnet,
+                            "msid": getattr(self.server, "matchmaking_next_msid", 1),
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                        }
+                        self.server.matchmaking_next_msid = entry["msid"] + 1
+                        entries.append(entry)
+                emit(
+                    "matchmaking-queue-join",
+                    peer=self.client_address,
+                    request_index=request_index,
+                    persona_id=persona_id,
+                    display_name=display_name,
+                    mode=mode,
+                    gset=gset,
+                    gver=gver,
+                    matchup_hash=matchup_hash,
+                    pnet=pnet,
+                    msid=entry["msid"] if entry else None,
+                    queue_key=list(queue_key),
+                    queue_size=len(queue[queue_key]) if queue is not None else None,
+                )
+                body = build_matchmaking_join_queue_response(payload)
+                response_name = "matchmaking-join-queue-experiment"
+            elif component == MATCHMAKING_COMPONENT and command == 14:
+                # LeaveQueue: drop the entry by persona_id (or MSID when the
+                # client echoes one) and acknowledge with an empty body.
+                msid = extract_tdf_u32(frame[12:], b"MSID")
+                queue = getattr(self.server, "matchmaking_queue", None)
+                queue_lock = getattr(self.server, "matchmaking_lock", None)
+                removed = 0
+                if queue is not None and queue_lock is not None:
+                    with queue_lock:
+                        for entries in queue.values():
+                            before = len(entries)
+                            entries[:] = [
+                                item
+                                for item in entries
+                                if not (
+                                    (msid is not None and item.get("msid") == msid)
+                                    or item.get("persona_id") == persona_id
+                                )
+                            ]
+                            removed += before - len(entries)
+                emit(
+                    "matchmaking-queue-leave",
+                    peer=self.client_address,
+                    request_index=request_index,
+                    persona_id=persona_id,
+                    msid=msid,
+                    removed=removed,
+                )
+                body = b""
+                response_name = "matchmaking-leave-queue"
             else:
                 if component == EASFC_COMPONENT and getattr(self.server, "debug_logging", False):
                     emit(
@@ -1796,6 +2036,7 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                     component,
                     command,
                     frame[12:],
+                    persona_id=persona_id,
                 )
                 if shared_response is None:
                     body = b""
@@ -1909,9 +2150,9 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                             0x7802,
                             8,
                             build_user_authenticated_body(
-                                player_id=1_000_001,
-                                user_id=1_000_001,
-                                display_name="LocalFUT",
+                                player_id=persona_id,
+                                user_id=persona_id,
+                                display_name=display_name,
                                 locale=client_locale,
                             ),
                         ),
@@ -1922,8 +2163,9 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                             0x7802,
                             2,
                             build_user_added_body(
-                                player_id=1_000_001,
-                                user_id=1_000_001,
+                                player_id=persona_id,
+                                user_id=persona_id,
+                                display_name=display_name,
                                 locale=client_locale,
                                 # Match the compact FIFA-era notification used
                                 # by New-Blaze-Emulator (DATA + USER only).
@@ -1936,7 +2178,7 @@ class BlazeProbe(socketserver.BaseRequestHandler):
                         build_fire_notification(
                             0x7802,
                             1,
-                            build_user_extended_data_body(user_id=1_000_001),
+                            build_user_extended_data_body(user_id=persona_id),
                         ),
                     ),
                 )
@@ -2633,6 +2875,76 @@ class HttpProbe(BaseHTTPRequestHandler):
                 account=account_key or None, coins=coins, balance=int(result["balanceAfter"]),
             )
         elif (
+            probe_name == "fut-http"
+            and path_without_query == "/__fifa14_local_fut_admin/bind_client"
+            and effective_method == "POST"
+        ):
+            # Fase 0a: the launcher records which persona this client IP maps to
+            # BEFORE the game opens, so Blaze OriginLogin can resolve identity
+            # from the very first launch of each PC.
+            admin_secret = str(getattr(self.server, "admin_secret", ""))
+            supplied_secret = str(self.headers.get("X-Admin-Secret", ""))
+            if admin_secret and supplied_secret != admin_secret:
+                payload = build_fut_json_payload({"error": "forbidden"})
+                self.send_response(401)
+                self.send_header("content-type", "application/json; charset=utf-8")
+                self.send_header("connection", "close")
+                emit("fase0a-admin-bind-client", path=self.path, status=401)
+                return
+            if identity_store is None or not hasattr(identity_store, "resolve_persona"):
+                payload = build_fut_json_payload({"error": "unsupported"})
+                self.send_response(500)
+                self.send_header("content-type", "application/json; charset=utf-8")
+                self.send_header("connection", "close")
+                emit("fase0a-admin-bind-client", path=self.path, status=500, reason="no-identity-store")
+                return
+            try:
+                request_body = json.loads(body.decode("utf-8"))
+                account_key = str(request_body.get("account") or "").strip()
+            except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                payload = build_fut_json_payload({"error": "invalid-body"})
+                self.send_response(400)
+                self.send_header("content-type", "application/json; charset=utf-8")
+                self.send_header("connection", "close")
+                emit("fase0a-admin-bind-client", path=self.path, status=400)
+                return
+            if not account_key:
+                payload = build_fut_json_payload({"error": "account-required"})
+                self.send_response(400)
+                self.send_header("content-type", "application/json; charset=utf-8")
+                self.send_header("connection", "close")
+                emit("fase0a-admin-bind-client", path=self.path, status=400, reason="missing-account")
+                return
+            client_ip = self.client_address[0] if self.client_address else ""
+            try:
+                persona_id = identity_store.resolve_persona(account_key)
+                identity_store.bind_client_ip(persona_id, client_ip)
+            except Exception as error:
+                payload = build_fut_json_payload({"error": "bind-failed", "detail": str(error)})
+                self.send_response(500)
+                self.send_header("content-type", "application/json; charset=utf-8")
+                self.send_header("connection", "close")
+                emit(
+                    "fase0a-admin-bind-client", path=self.path, status=500,
+                    account=account_key, client_ip=client_ip, error=str(error),
+                )
+                return
+            set_client_persona(persona_id)
+            payload = build_fut_json_payload({
+                "bound": True,
+                "persona_id": persona_id,
+                "client_ip": client_ip,
+                "account": account_key,
+            })
+            self.send_response(200)
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.send_header("cache-control", "no-store")
+            self.send_header("connection", "close")
+            emit(
+                "fase0a-admin-bind-client", path=self.path, status=200,
+                account=account_key, persona_id=persona_id, client_ip=client_ip,
+            )
+        elif (
             probe_name in {"fut-http", "dynamic-http"}
             and self._is_icebreaker_packlist_path(path_without_query)
         ):
@@ -2925,7 +3237,10 @@ class HttpProbe(BaseHTTPRequestHandler):
         ):
             try:
                 sid = (
-                    identity_store.start_session(body)
+                    identity_store.start_session(
+                        body,
+                        client_ip=self.client_address[0] if self.client_address else "",
+                    )
                     if identity_store is not None
                     else "LOCAL-FIFA14-SID"
                 )
@@ -4233,11 +4548,28 @@ class HttpProbe(BaseHTTPRequestHandler):
         ):
             if identity_store is not None and hasattr(identity_store, "offline_seasons_list"):
                 if path_without_query == "/ut/game/fifa14/season/user":
-                    response = identity_store.offline_season_user()
-                    response_name = "fut-offline-season-user-beta2"
+                    # R13.1 E1: season/user also dispatches on `type` so the
+                    # ONLINE flow gets the provisional division-11 state.
+                    season_type = (parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("type") or [""])[0].strip().lower()
+                    if season_type == "online" and hasattr(identity_store, "online_season_user"):
+                        response = identity_store.online_season_user()
+                        response_name = "fut-online-season-user-beta2"
+                    else:
+                        response = identity_store.offline_season_user()
+                        response_name = "fut-offline-season-user-beta2"
                 else:
-                    response = identity_store.offline_seasons_list()
-                    response_name = "fut-offline-seasons-beta2"
+                    # R13: Season Online requests season/list?type=online; the
+                    # old handler ignored the query and served only OFFLINE
+                    # seasons, so the client aborted with "no pudo recuperar la
+                    # temporada" before ever emitting Blaze component 4. Dispatch
+                    # on `type` and keep OFFLINE for the offline flow (R7).
+                    season_type = (parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("type") or [""])[0].strip().lower()
+                    if season_type == "online" and hasattr(identity_store, "online_seasons_list"):
+                        response = identity_store.online_seasons_list()
+                        response_name = "fut-online-seasons-beta2"
+                    else:
+                        response = identity_store.offline_seasons_list()
+                        response_name = "fut-offline-seasons-beta2"
             else:
                 response = {"seasons": []}
                 response_name = "fut-seasons-empty"
@@ -5246,6 +5578,14 @@ def main() -> int:
     )
     fut_http.identity_store = identity_store
     main_blaze.identity_store = identity_store
+    # Fase 1 (matchmaking remoto): in-memory Season Online queue keyed by the
+    # client's queue signature (MODE, GSET, GVER, fifaMatchupHash). Command 13
+    # joins with its own PNET (LAN IP + port); command 14 leaves by MSID. The
+    # response body for command 13 stays empty (F3 unresolved) so the observed
+    # client behaviour is preserved until the expected response schema is known.
+    main_blaze.matchmaking_queue = {}
+    main_blaze.matchmaking_lock = threading.Lock()
+    main_blaze.matchmaking_next_msid = 1
     servers = [redirector, main_blaze, http, fut_http]
     dynamic_http = None
     if args.dynamic_http_port > 0:

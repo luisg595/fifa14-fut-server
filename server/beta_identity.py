@@ -246,6 +246,60 @@ def _native_season_record(index: int, division: int, matches: int, promote: int,
     }
 
 
+def _online_season_matches(division: int, match_count: int) -> list[dict[str, Any]]:
+    # Online matches have no AI opponent: teamId/difficulty are 0 (the rival
+    # comes from the matchmaking queue). Keep the parser-native members the
+    # season-list parser already consumes offline (rewardMult, roundId, coins).
+    rows: list[dict[str, Any]] = []
+    for index in range(max(0, int(match_count))):
+        rows.append({
+            "teamId": 0,
+            "difficulty": 0,
+            "rewardMult": 1,
+            "roundId": int(index),
+            "coins": int(250 + (10 - int(division)) * 25 + index * 10),
+        })
+    return rows
+
+
+def _native_online_season_record(index: int, division: int, matches: int, promote: int, championship_coins: int) -> dict[str, Any]:
+    # Same native schema as the offline record (R13) but type ONLINE and
+    # matches without an AI opponent. Divisions share the offline thresholds
+    # until the online parser is traced (F2/F3 instrumentación ya lista).
+    title_threshold = 12 if int(division) == 10 else min(30, int(promote) + 3)
+    maintenance_threshold = 0
+    holding_coins = 300 if int(division) == 10 else max(300, int(championship_coins) // 5)
+    promotion_coins = 1500 if int(division) == 10 else max(500, int(championship_coins) - 400)
+    return {
+        "id": int(index),
+        "type": "ONLINE",
+        "divisionId": int(division),
+        "numMatches": int(matches),
+        "matchLengthMin": 6,
+        "matches": _online_season_matches(int(division), int(matches)),
+        "prizeSet": [
+            _season_prize("RELEGATION", 0, 0),
+            _season_prize("MAINTENANCE", maintenance_threshold, holding_coins),
+            _season_prize("PROMOTION", int(promote), promotion_coins),
+            _season_prize("CHAMPIONSHIP", title_threshold, int(championship_coins)),
+        ],
+        "elgOperation": "AND",
+        "elgReq": [],
+        # E2 (H-B, R13.1): the ONLINE parser resolves the trophy item id
+        # literally from trophyResourceId (it polls /fut/items/pc/-1.json for
+        # -1). 0 mirrors the accepted OFFLINE "no reward item" sentinel
+        # (probe.py:3068-3077) so the client requests 0.json instead.
+        "trophyResourceId": 0,
+        "trophyUseCount": 0,
+        "visStartDays": 3650,
+        "visEndDays": 3650,
+        "startDateTime": 0,
+        "endDateTime": 2147483647,
+        "untilStartSeconds": 0,
+        "untilEndSeconds": 315360000,
+    }
+
+
 def _native_tournament_round(round_id: int, difficulty: int, coins: int) -> dict[str, Any]:
     return {
         "id": int(round_id),
@@ -2502,6 +2556,35 @@ class BetaIdentityStore(LocalIdentityStore):
             # Wire round 1 represents the first scheduled match (internal 0).
             round_index = 0 if row is None else max(0, int(row["matches_played"]))
         return {"seasonId": 1, "divisionId": 10, "round": round_index + 1}
+
+    def online_seasons_list(self) -> dict[str, Any]:
+        """Return the ONLINE-season list for `season/list?type=online` (R13).
+
+        Mirrors the native offline schema but type ONLINE and matches with no
+        AI opponent (teamId/difficulty 0). The rival comes from matchmaking.
+
+        E1 (H-A, R13.1): `season/list?type=online&divisionList=11` — the client
+        looks up the season of its current (provisional) division 11, so a
+        provisional record is prepended as the first entry (id 1). Divisions
+        10→1 follow (ids 2..11).
+        """
+        seasons = [
+            _native_online_season_record(1, 11, 10, 3, 1300),
+        ] + [
+            _native_online_season_record(index, division, matches, promote, coins)
+            for index, (division, _name, matches, promote, coins) in enumerate(OFFLINE_SEASON_DIVISIONS, start=2)
+        ]
+        return {"seasons": seasons}
+
+    def online_season_user(self) -> dict[str, Any]:
+        """Current online-season state: same shape as the offline season/user.
+
+        E1 (H-A): the provisional division 11 is the active online season; it is
+        the first season-list record, and the client decrements the wire
+        `seasonId` (1 → index 0). `round` is 1-based for the first scheduled
+        match.
+        """
+        return {"seasonId": 1, "divisionId": 11, "round": 1}
 
     def tournament_wire_mode(self) -> str:
         raw = os.environ.get("FIFA14_TOURNAMENT_MODE", "native").strip().lower()

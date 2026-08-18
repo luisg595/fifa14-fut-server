@@ -7,12 +7,15 @@ y finalmente la verificación SC-A2.
 
 ## 1. Rama de integración (en la máquina de desarrollo)
 
+La rama `feat/online-en-menu` sale de `main` (multi-squad); el trabajo online
+del stash se integra como un único commit:
+
 ```bash
 cd /path/to/fifa14-fut-server
-git stash list                 # confirmar stash@{0} = b38406e
-git checkout -b feat/online-en-menu b38406e
-git merge main                 # resolver conflictos conservando ambos trabajos
+git merge --squash b38406e    # integra el trabajo online del stash (1 commit)
+# resolver conflictos conservando ambos trabajos + dev/* de main
 # py_compile server/*.py + smoke --beta-mode
+git commit
 git push -u origin feat/online-en-menu
 ```
 

@@ -4,12 +4,12 @@
 
 ## 1. Integración (fifa14-fut-server)
 
-### 1.1. Crear la rama desde el stash
+### 1.1. Integrar el trabajo online (rama ya sale de main)
 
-- [ ] `git stash list` → confirmar que `stash@{0}` = `b38406e`.
-- [ ] `git checkout -b feat/online-en-menu b38406e` (recupera todo el trabajo
-      online del stash en una rama real).
-- [ ] `git merge main` → resolver conflictos conservando:
+- [ ] Rama `feat/online-en-menu` ya creada desde `main` (52af29b) + spec.
+- [ ] `git merge --squash b38406e` → integra el trabajo online del stash como
+      **un único commit** (sin la historia de 14 commits). Resolver conflictos
+      conservando:
       - de `main`: multi-squad (`dev/verify_fifa14_multi_squad.py`,
         `dev/summarize_fifa14_squad_requests.py`, cambios multi-squad de
         `beta_identity.py`).

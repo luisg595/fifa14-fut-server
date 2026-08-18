@@ -22,4 +22,5 @@ exec python /app/server/probe.py \
   --cert-dir /app/certs \
   --identity-db /app/state/local-fut.sqlite3 \
   --beta-mode --fut-account-mode existing \
-  --admin-secret "${ADMIN_SECRET:?ADMIN_SECRET no está definido (revisa .env)}"
+  --admin-secret "${ADMIN_SECRET:?ADMIN_SECRET no está definido (revisa .env)}" \
+  --debug
